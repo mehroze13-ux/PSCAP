@@ -258,12 +258,17 @@ async def scrape_page(browser, page_num: int) -> list[dict]:
         ),
         viewport={"width": 1366, "height": 768},
         locale="en-IN",
+        ignore_https_errors=True,
         extra_http_headers={
             "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
             "Accept": (
                 "text/html,application/xhtml+xml,application/xml;"
                 "q=0.9,image/webp,*/*;q=0.8"
             ),
+            "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "Upgrade-Insecure-Requests": "1",
         },
     )
 
@@ -288,18 +293,14 @@ async def scrape_page(browser, page_num: int) -> list[dict]:
 
     url = f"{BASE_URL}?page_no={page_num}&{PARAMS}"
     try:
-        await page.goto(url, wait_until="networkidle", timeout=60_000)
-    except PlaywrightTimeout:
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-            await page.wait_for_timeout(4_000)
-        except Exception as e:
-            print(f"    Page {page_num} failed to load: {e}")
-            await context.close()
-            return []
+        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+    except Exception as e:
+        print(f"    Page {page_num} failed to load: {e}")
+        await context.close()
+        return []
 
-    # Extra settle time for JS-rendered content
-    await page.wait_for_timeout(2_000)
+    # Wait for JS-rendered content to settle
+    await page.wait_for_timeout(4_000)
 
     products: list[dict] = []
 
@@ -346,6 +347,9 @@ async def main():
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-http2",
+                "--disable-web-security",
+                "--allow-running-insecure-content",
             ],
         )
 
