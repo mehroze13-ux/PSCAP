@@ -263,7 +263,7 @@ async def main():
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async with async_playwright() as pw:
-        browser = await pw.launch(
+        browser = await pw.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
