@@ -21,7 +21,7 @@ from playwright.async_api import async_playwright
 
 INPUT_FILE  = "nykaa_fragrances.csv"   # CSV with product_url column
 OUTPUT_FILE = "nykaa_fragrances_full.csv"
-CONCURRENCY = 5                         # parallel browser pages
+CONCURRENCY = 3                         # parallel browser pages
 URL_COLUMN  = "product_url"
 
 CSV_FIELDS = [
@@ -239,7 +239,9 @@ async def main():
         for row in csv.DictReader(f):
             url = row.get(URL_COLUMN, "").strip()
             if url:
-                all_urls.append(url)
+                # Strip tracking params — keep only the clean product URL
+                clean = url.split("?")[0]
+                all_urls.append(clean)
 
     print(f"Loaded {len(all_urls)} URLs from {input_file}")
 
