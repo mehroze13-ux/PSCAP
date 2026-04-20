@@ -11,11 +11,12 @@ Usage:
 
 import asyncio
 import csv
+import json
 import re
 import random
 from pathlib import Path
 
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from playwright.async_api import async_playwright
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -43,10 +44,14 @@ def clean_price(s) -> str:
 
 def clean_number(s) -> str:
     s = str(s).replace(",", "").strip()
+    # Handle "1.2k" → 1200
+    m = re.match(r"([\d.]+)\s*k", s, re.I)
+    if m:
+        return str(int(float(m.group(1)) * 1000))
     m = re.search(r"\d+", s)
     return m.group(0) if m else ""
 
-# ── JSON parser ───────────────────────────────────────────────────────────────
+# ── JSON parser (used for both __NEXT_DATA__ and API intercepts) ──────────────
 
 def _find_product_lists(obj, depth: int = 0) -> list:
     found = []
@@ -54,7 +59,7 @@ def _find_product_lists(obj, depth: int = 0) -> list:
         return found
     if isinstance(obj, list) and len(obj) > 1 and isinstance(obj[0], dict):
         sample = obj[0]
-        if any(k in sample for k in ("name", "title", "productName", "brand", "brandName", "sku")):
+        if any(k in sample for k in ("name", "title", "productName", "brand", "brandName", "sku", "slug")):
             found.append(obj)
     elif isinstance(obj, dict):
         for v in obj.values():
@@ -66,7 +71,6 @@ def parse_from_json(data, page_num: int) -> list[dict]:
     if not candidates:
         return []
 
-    # Pick the largest list — most likely the main product listing
     items = max(candidates, key=len)
     products = []
 
@@ -103,8 +107,8 @@ def parse_from_json(data, page_num: int) -> list[dict]:
             "discount_percent": str(disc).replace("%", "").strip(),
             "volume_ml":        volume,
             "rating":           str(rat),
-            "num_ratings":      clean_number(nrat),
-            "num_reviews":      clean_number(nrev),
+            "num_ratings":      clean_number(str(nrat)),
+            "num_reviews":      clean_number(str(nrev)),
             "product_url":      product_url,
             "image_url":        str(image_url),
             "page_no":          page_num,
@@ -112,85 +116,109 @@ def parse_from_json(data, page_num: int) -> list[dict]:
 
     return products
 
-# ── HTML parser (fallback) ────────────────────────────────────────────────────
+# ── JS DOM extractor (fallback) ───────────────────────────────────────────────
 
-async def parse_from_html(page, page_num: int) -> list[dict]:
-    """
-    Find all product links on the page (href matches Nykaa product URL pattern),
-    then extract data from each card's surrounding container.
-    """
-    # All anchor tags linking to product pages
-    links = await page.query_selector_all("a[href*='/p/']")
-    if not links:
-        links = await page.query_selector_all("a[href*='nykaa.com']")
+# Runs inside the browser — extracts leaf text nodes per product card
+JS_EXTRACTOR = """
+() => {
+    const seen = new Set();
+    const results = [];
 
-    seen_urls = set()
-    products = []
+    const links = document.querySelectorAll('a[href*="/p/"]');
 
-    for link in links:
-        try:
-            href = await link.get_attribute("href") or ""
-            if not href or href in seen_urls:
-                continue
-            # Only product detail pages
-            if "/p/" not in href and not re.search(r"/\d+$", href):
-                continue
-            seen_urls.add(href)
+    for (const a of links) {
+        const href = a.getAttribute('href') || '';
+        if (!href || seen.has(href)) continue;
+        seen.add(href);
 
-            product_url = (
-                f"https://www.nykaa.com{href}"
-                if href.startswith("/") else href
-            )
+        // Collect all leaf-node texts in DOM order
+        const texts = [];
+        const walk = (el) => {
+            for (const child of el.childNodes) {
+                if (child.nodeType === 3) {          // TEXT_NODE
+                    const t = child.textContent.trim();
+                    if (t) texts.push(t);
+                } else if (child.nodeType === 1) {   // ELEMENT_NODE
+                    walk(child);
+                }
+            }
+        };
+        walk(a);
 
-            # Get all text content from the card
-            card_text = await link.inner_text()
-            lines = [l.strip() for l in card_text.splitlines() if l.strip()]
+        const img = a.querySelector('img');
+        const imgSrc = img ? (img.src || img.getAttribute('data-src') || '') : '';
 
-            # Image
-            img = await link.query_selector("img")
-            image_url = ""
-            if img:
-                image_url = (
-                    await img.get_attribute("src") or
-                    await img.get_attribute("data-src") or ""
-                )
+        results.push({ href, texts, img: imgSrc });
+    }
+    return results;
+}
+"""
 
-            # Parse lines heuristically
-            name = lines[0] if lines else ""
-            brand = lines[1] if len(lines) > 1 else ""
-            price = ""
-            mrp = ""
-            rating = ""
-            num_ratings = ""
+def parse_card_texts(href: str, texts: list, img: str, page_num: int) -> dict:
+    """Heuristically parse leaf text nodes from a Nykaa product card."""
+    product_url = (
+        f"https://www.nykaa.com{href}" if href.startswith("/") else href
+    )
 
-            for line in lines:
-                if re.match(r"^[₹\d]", line) and not price:
-                    price = clean_price(line)
-                elif re.match(r"^\d+(\.\d+)?$", line) and float(line.replace(",","")) <= 5:
-                    rating = line
-                elif re.search(r"\d+\s*(ratings?|reviews?|K\s*ratings?)", line, re.I):
-                    num_ratings = clean_number(line)
-                elif "MRP" in line.upper():
-                    mrp = clean_price(line)
+    name = brand = price = mrp = discount = rating = num_ratings = ""
 
-            products.append({
-                "name":             name,
-                "brand":            brand,
-                "mrp":              mrp or price,
-                "price":            price,
-                "discount_percent": "",
-                "volume_ml":        extract_volume(name),
-                "rating":           rating,
-                "num_ratings":      num_ratings,
-                "num_reviews":      "",
-                "product_url":      product_url,
-                "image_url":        image_url,
-                "page_no":          page_num,
-            })
-        except Exception:
-            continue
+    price_pattern    = re.compile(r"^₹[\d,]+$")
+    mrp_pattern      = re.compile(r"MRP\s*₹[\d,]+", re.I)
+    discount_pattern = re.compile(r"\d+\s*%\s*off", re.I)
+    rating_pattern   = re.compile(r"^[\d.]+$")
+    reviews_pattern  = re.compile(r"[\d.,]+\s*k?\s*(ratings?|reviews?|★|ratings?\s*&)", re.I)
+    star_pattern     = re.compile(r"^[\d.]+\s*★")
 
-    print(f"    HTML fallback: {len(products)} products")
+    unmatched = []
+
+    for t in texts:
+        if price_pattern.match(t):
+            if not price:
+                price = clean_price(t)
+            elif not mrp:
+                mrp = clean_price(t)
+        elif mrp_pattern.search(t):
+            mrp = clean_price(t)
+        elif discount_pattern.search(t):
+            discount = re.search(r"\d+", t).group(0)
+        elif star_pattern.match(t):
+            # e.g. "4.2 ★"
+            m = re.search(r"[\d.]+", t)
+            if m and not rating:
+                rating = m.group(0)
+        elif reviews_pattern.search(t):
+            num_ratings = clean_number(t)
+        elif rating_pattern.match(t) and float(t) <= 5.0 and not rating:
+            rating = t
+        else:
+            unmatched.append(t)
+
+    # First two unmatched text chunks are brand then name (Nykaa's ordering)
+    non_trivial = [u for u in unmatched if len(u) > 1 and u not in ("★", "|", "•")]
+    if non_trivial:
+        brand = non_trivial[0]
+    if len(non_trivial) > 1:
+        name = non_trivial[1]
+
+    return {
+        "name":             name,
+        "brand":            brand,
+        "mrp":              mrp or price,
+        "price":            price,
+        "discount_percent": discount,
+        "volume_ml":        extract_volume(name),
+        "rating":           rating,
+        "num_ratings":      num_ratings,
+        "num_reviews":      "",
+        "product_url":      product_url,
+        "image_url":        img,
+        "page_no":          page_num,
+    }
+
+async def parse_from_dom(page, page_num: int) -> list[dict]:
+    cards = await page.evaluate(JS_EXTRACTOR)
+    products = [parse_card_texts(c["href"], c["texts"], c["img"], page_num) for c in cards]
+    print(f"    DOM fallback: {len(products)} products")
     return products
 
 # ── Per-page scrape ───────────────────────────────────────────────────────────
@@ -218,7 +246,6 @@ async def scrape_page(browser, page_num: int) -> list[dict]:
     page = await context.new_page()
     intercepted: list[dict] = []
 
-    # Intercept ALL JSON responses and check if they contain product data
     async def capture(response):
         if response.status != 200:
             return
@@ -244,27 +271,41 @@ async def scrape_page(browser, page_num: int) -> list[dict]:
 
     await page.wait_for_timeout(3_000)
 
-    # Scroll down to trigger lazy-loaded products
-    for _ in range(5):
+    # Scroll to trigger lazy-loaded products
+    for _ in range(6):
         await page.evaluate("window.scrollBy(0, window.innerHeight)")
-        await page.wait_for_timeout(800)
+        await page.wait_for_timeout(700)
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await page.wait_for_timeout(2_000)
 
     products: list[dict] = []
 
-    # Pick the intercepted response with the most products
-    best = []
-    for data in intercepted:
-        parsed = parse_from_json(data, page_num)
-        if len(parsed) > len(best):
-            best = parsed
+    # ── Strategy 1: __NEXT_DATA__ (embedded JSON in page HTML) ──
+    try:
+        next_data = await page.evaluate(
+            "() => { try { return JSON.parse(document.getElementById('__NEXT_DATA__').textContent); } catch(e) { return null; } }"
+        )
+        if next_data:
+            products = parse_from_json(next_data, page_num)
+            if products:
+                print(f"    __NEXT_DATA__: {len(products)} products")
+    except Exception:
+        pass
 
-    if best:
-        products = best
-        print(f"    API intercept: {len(products)} products")
-    else:
-        products = await parse_from_html(page, page_num)
+    # ── Strategy 2: intercepted API JSON responses ──
+    if not products:
+        best: list[dict] = []
+        for data in intercepted:
+            parsed = parse_from_json(data, page_num)
+            if len(parsed) > len(best):
+                best = parsed
+        if best:
+            products = best
+            print(f"    API intercept: {len(products)} products")
+
+    # ── Strategy 3: JS DOM extraction ──
+    if not products:
+        products = await parse_from_dom(page, page_num)
 
     await context.close()
     return products
@@ -317,7 +358,6 @@ async def main():
             else:
                 print(f"  ✗  Page {page_num} skipped after 3 failures.")
 
-            # Save after every page
             with open(output_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
                 writer.writeheader()
