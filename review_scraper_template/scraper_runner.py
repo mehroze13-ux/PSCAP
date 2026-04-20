@@ -26,7 +26,7 @@ from scraper import scrape_reviews_for_asin, scrape_product_rating
 PRODUCTS_CSV      = os.path.join(os.path.dirname(__file__), "products.csv")
 CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "")
 PAUSE_SECONDS     = float(os.getenv("SCRAPER_PAUSE", "8"))
-CHROME_PROFILE    = os.getenv("CHROME_PROFILE", os.path.join(os.path.dirname(__file__), "chrome-profile"))
+CHROME_PROFILE    = os.getenv("CHROME_PROFILE", "").strip() or os.path.join(os.path.dirname(__file__), "chrome-profile")
 os.makedirs(CHROME_PROFILE, exist_ok=True)
 
 _filter_raw  = os.getenv("SCRAPE_ASINS", "").strip()
