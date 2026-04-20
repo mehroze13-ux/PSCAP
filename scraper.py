@@ -242,7 +242,14 @@ async def scrape_page(browser, page_num: int) -> list[dict]:
         await context.close()
         return []
 
-    await page.wait_for_timeout(4_000)
+    await page.wait_for_timeout(3_000)
+
+    # Scroll down to trigger lazy-loaded products
+    for _ in range(5):
+        await page.evaluate("window.scrollBy(0, window.innerHeight)")
+        await page.wait_for_timeout(800)
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(2_000)
 
     products: list[dict] = []
 
