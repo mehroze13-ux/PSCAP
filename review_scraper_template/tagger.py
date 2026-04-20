@@ -1,6 +1,6 @@
 """
 tagger.py
-Reads untagged reviews from the DB, sends them to GPT-4o-mini in batches,
+Reads untagged reviews from the DB, sends them to Claude in batches,
 and saves sentiment + category tags.
 
 Taxonomy is loaded from taxonomy.json — edit that file to match your products.
@@ -9,7 +9,7 @@ Taxonomy is loaded from taxonomy.json — edit that file to match your products.
 import json
 import os
 import pymysql
-from openai import OpenAI
+import anthropic
 from dotenv import load_dotenv
 
 load_dotenv(".env")
@@ -17,18 +17,18 @@ load_dotenv(".env")
 # ── Config ──────────────────────────────────────────────────────────────────────
 
 BATCH_SIZE  = 5
-MODEL       = "gpt-4o-mini"
+MODEL       = "claude-haiku-4-5-20251001"
 RETAG_ALL   = os.getenv("RETAG_ALL_REVIEWS_ON_PIPELINE", "").strip().lower() in {"1", "true", "yes"}
 
 TAXONOMY_PATH = os.path.join(os.path.dirname(__file__), "taxonomy.json")
 with open(TAXONOMY_PATH, encoding="utf-8") as f:
     TAXONOMY = json.load(f)
 
-api_key = os.getenv("OPENAI_API_KEY")
+api_key = os.getenv("ANTHROPIC_API_KEY")
 if not api_key:
-    raise RuntimeError("OPENAI_API_KEY not set in .env")
+    raise RuntimeError("ANTHROPIC_API_KEY not set in .env")
 
-client = OpenAI(api_key=api_key)
+client = anthropic.Anthropic(api_key=api_key)
 
 # ── Database ────────────────────────────────────────────────────────────────────
 
@@ -94,15 +94,15 @@ for batch in chunks(rows, BATCH_SIZE):
     payload = [{"id": row[0], "product": row[2], "text": row[3]} for row in batch]
 
     try:
-        response = client.chat.completions.create(
+        response = client.messages.create(
             model=MODEL,
+            max_tokens=1024,
+            system="You output strict JSON only.",
             messages=[
-                {"role": "system", "content": "You output strict JSON only."},
-                {"role": "user",   "content": build_prompt(payload)},
+                {"role": "user", "content": build_prompt(payload)},
             ],
-            temperature=0,
         )
-        parsed = json.loads(response.choices[0].message.content.strip())
+        parsed = json.loads(response.content[0].text.strip())
     except Exception as e:
         print(f"Batch failed: {e}")
         continue
