@@ -9,7 +9,7 @@ Taxonomy is loaded from taxonomy.json — edit that file to match your products.
 import json
 import os
 import pymysql
-import anthropic
+import google.generativeai as genai
 from dotenv import load_dotenv
 
 load_dotenv(".env")
@@ -17,18 +17,19 @@ load_dotenv(".env")
 # ── Config ──────────────────────────────────────────────────────────────────────
 
 BATCH_SIZE  = 5
-MODEL       = "claude-haiku-4-5-20251001"
+MODEL       = "gemini-1.5-flash"
 RETAG_ALL   = os.getenv("RETAG_ALL_REVIEWS_ON_PIPELINE", "").strip().lower() in {"1", "true", "yes"}
 
 TAXONOMY_PATH = os.path.join(os.path.dirname(__file__), "taxonomy.json")
 with open(TAXONOMY_PATH, encoding="utf-8") as f:
     TAXONOMY = json.load(f)
 
-api_key = os.getenv("ANTHROPIC_API_KEY")
+api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
-    raise RuntimeError("ANTHROPIC_API_KEY not set in .env")
+    raise RuntimeError("GEMINI_API_KEY not set in .env")
 
-client = anthropic.Anthropic(api_key=api_key)
+genai.configure(api_key=api_key)
+client = genai.GenerativeModel(MODEL)
 
 # ── Database ────────────────────────────────────────────────────────────────────
 
@@ -94,15 +95,13 @@ for batch in chunks(rows, BATCH_SIZE):
     payload = [{"id": row[0], "product": row[2], "text": row[3]} for row in batch]
 
     try:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=1024,
-            system="You output strict JSON only.",
-            messages=[
-                {"role": "user", "content": build_prompt(payload)},
-            ],
-        )
-        parsed = json.loads(response.content[0].text.strip())
+        response = client.generate_content(build_prompt(payload))
+        text = response.text.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        parsed = json.loads(text.strip())
     except Exception as e:
         print(f"Batch failed: {e}")
         continue
