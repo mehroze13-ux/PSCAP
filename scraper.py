@@ -11,7 +11,6 @@ Usage:
 
 import asyncio
 import csv
-import json
 import re
 import random
 from pathlib import Path
@@ -26,9 +25,8 @@ TOTAL_PAGES = 135
 OUTPUT_FILE = "nykaa_fragrances.csv"
 
 CSV_FIELDS = [
-    "name", "brand", "mrp", "price", "discount_percent",
-    "volume_ml", "rating", "num_ratings", "num_reviews",
-    "product_url", "image_url", "page_no",
+    "name", "mrp", "price", "discount_percent",
+    "volume_ml", "num_ratings", "product_url", "image_url", "page_no",
 ]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -37,189 +35,104 @@ def extract_volume(text: str) -> str:
     m = re.search(r"(\d+(?:\.\d+)?)\s*(?:ml|ML|Ml|mL)", text or "")
     return m.group(0) if m else ""
 
-def clean_price(s) -> str:
-    s = str(s).replace(",", "").replace("₹", "").strip()
-    m = re.search(r"\d+(?:\.\d+)?", s)
-    return m.group(0) if m else ""
-
-def clean_number(s) -> str:
-    s = str(s).replace(",", "").strip()
-    # Handle "1.2k" → 1200
-    m = re.match(r"([\d.]+)\s*k", s, re.I)
-    if m:
-        return str(int(float(m.group(1)) * 1000))
+def clean_price(s: str) -> str:
+    s = str(s).replace(",", "").replace("₹", "").replace(".", "").strip()
     m = re.search(r"\d+", s)
     return m.group(0) if m else ""
 
-# ── JSON parser (used for both __NEXT_DATA__ and API intercepts) ──────────────
+def clean_number(s: str) -> str:
+    s = str(s).replace(",", "").strip()
+    m = re.search(r"\d+", s)
+    return m.group(0) if m else ""
 
-def _find_product_lists(obj, depth: int = 0) -> list:
-    found = []
-    if depth > 8:
-        return found
-    if isinstance(obj, list) and len(obj) > 1 and isinstance(obj[0], dict):
-        sample = obj[0]
-        if any(k in sample for k in ("name", "title", "productName", "brand", "brandName", "sku", "slug")):
-            found.append(obj)
-    elif isinstance(obj, dict):
-        for v in obj.values():
-            found.extend(_find_product_lists(v, depth + 1))
-    return found
+# ── Card text parser ──────────────────────────────────────────────────────────
+# Observed format from debug:
+#   "Brand+Name\n₹MRP\n₹Price\n10% Off\nRegular price ₹MRP. Discounted...\n( 274 )"
+#   "Brand+Name (50ml)\nPrice ₹8355.\n₹8355\n\nOffer Available\n\n( 88 )"
 
-def parse_from_json(data, page_num: int) -> list[dict]:
-    candidates = _find_product_lists(data)
-    if not candidates:
-        return []
-
-    items = max(candidates, key=len)
-    products = []
-
-    for item in items:
-        name  = item.get("name") or item.get("title") or item.get("productName") or ""
-        brand = item.get("brand") or item.get("brandName") or ""
-        mrp   = item.get("mrp") or item.get("mop") or item.get("originalPrice") or ""
-        price = item.get("price") or item.get("discountedPrice") or item.get("offerPrice") or mrp
-        disc  = item.get("discount") or item.get("discountPercent") or ""
-        rat   = item.get("rating") or item.get("averageRating") or item.get("productRating") or ""
-        nrat  = item.get("ratingsCount") or item.get("ratingCount") or item.get("numRatings") or ""
-        nrev  = item.get("reviewsCount") or item.get("reviewCount") or item.get("numReviews") or ""
-
-        slug = item.get("slug") or item.get("url") or item.get("productUrl") or ""
-        product_url = (
-            f"https://www.nykaa.com{slug}"
-            if slug and not slug.startswith("http") else slug
-        )
-
-        imgs = item.get("images")
-        if isinstance(imgs, list) and imgs:
-            image_url = imgs[0].get("url", "") if isinstance(imgs[0], dict) else str(imgs[0])
-        else:
-            image_url = item.get("imageUrl") or item.get("image") or ""
-
-        attr_str = str(item.get("attributes") or item.get("specifications") or "")
-        volume = extract_volume(str(name) + " " + attr_str)
-
-        products.append({
-            "name":             str(name),
-            "brand":            str(brand),
-            "mrp":              clean_price(mrp),
-            "price":            clean_price(price),
-            "discount_percent": str(disc).replace("%", "").strip(),
-            "volume_ml":        volume,
-            "rating":           str(rat),
-            "num_ratings":      clean_number(str(nrat)),
-            "num_reviews":      clean_number(str(nrev)),
-            "product_url":      product_url,
-            "image_url":        str(image_url),
-            "page_no":          page_num,
-        })
-
-    return products
-
-# ── JS DOM extractor (fallback) ───────────────────────────────────────────────
-
-# Runs inside the browser — extracts leaf text nodes per product card
-JS_EXTRACTOR = """
-() => {
-    const seen = new Set();
-    const results = [];
-
-    const links = document.querySelectorAll('a[href*="/p/"]');
-
-    for (const a of links) {
-        const href = a.getAttribute('href') || '';
-        if (!href || seen.has(href)) continue;
-        seen.add(href);
-
-        // Collect all leaf-node texts in DOM order
-        const texts = [];
-        const walk = (el) => {
-            for (const child of el.childNodes) {
-                if (child.nodeType === 3) {          // TEXT_NODE
-                    const t = child.textContent.trim();
-                    if (t) texts.push(t);
-                } else if (child.nodeType === 1) {   // ELEMENT_NODE
-                    walk(child);
-                }
-            }
-        };
-        walk(a);
-
-        const img = a.querySelector('img');
-        const imgSrc = img ? (img.src || img.getAttribute('data-src') || '') : '';
-
-        results.push({ href, texts, img: imgSrc });
-    }
-    return results;
-}
-"""
-
-def parse_card_texts(href: str, texts: list, img: str, page_num: int) -> dict:
-    """Heuristically parse leaf text nodes from a Nykaa product card."""
+def parse_card(href: str, raw_text: str, img: str, page_num: int) -> dict:
     product_url = (
         f"https://www.nykaa.com{href}" if href.startswith("/") else href
     )
 
-    name = brand = price = mrp = discount = rating = num_ratings = ""
+    lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
 
-    price_pattern    = re.compile(r"^₹[\d,]+$")
-    mrp_pattern      = re.compile(r"MRP\s*₹[\d,]+", re.I)
-    discount_pattern = re.compile(r"\d+\s*%\s*off", re.I)
-    rating_pattern   = re.compile(r"^[\d.]+$")
-    reviews_pattern  = re.compile(r"[\d.,]+\s*k?\s*(ratings?|reviews?|★|ratings?\s*&)", re.I)
-    star_pattern     = re.compile(r"^[\d.]+\s*★")
+    name        = lines[0] if lines else ""
+    prices      = []
+    discount    = ""
+    num_ratings = ""
 
-    unmatched = []
+    for line in lines[1:]:
+        # "( 274 )" — review count
+        if re.match(r"^\(\s*[\d,]+\s*\)$", line):
+            num_ratings = clean_number(line)
 
-    for t in texts:
-        if price_pattern.match(t):
-            if not price:
-                price = clean_price(t)
-            elif not mrp:
-                mrp = clean_price(t)
-        elif mrp_pattern.search(t):
-            mrp = clean_price(t)
-        elif discount_pattern.search(t):
-            discount = re.search(r"\d+", t).group(0)
-        elif star_pattern.match(t):
-            # e.g. "4.2 ★"
-            m = re.search(r"[\d.]+", t)
-            if m and not rating:
-                rating = m.group(0)
-        elif reviews_pattern.search(t):
-            num_ratings = clean_number(t)
-        elif rating_pattern.match(t) and float(t) <= 5.0 and not rating:
-            rating = t
-        else:
-            unmatched.append(t)
+        # "₹1099" — bare price
+        elif re.match(r"^₹[\d,]+\.?$", line):
+            prices.append(clean_price(line))
 
-    # First two unmatched text chunks are brand then name (Nykaa's ordering)
-    non_trivial = [u for u in unmatched if len(u) > 1 and u not in ("★", "|", "•")]
-    if non_trivial:
-        brand = non_trivial[0]
-    if len(non_trivial) > 1:
-        name = non_trivial[1]
+        # "Price ₹8355." — labeled price
+        elif re.match(r"^Price\s+₹[\d,]+", line, re.I):
+            m = re.search(r"₹([\d,]+)", line)
+            if m:
+                prices.append(m.group(1).replace(",", ""))
+
+        # "10% Off"
+        elif re.match(r"^\d+%\s*Off$", line, re.I):
+            m = re.search(r"(\d+)%", line)
+            if m:
+                discount = m.group(1)
+
+        # skip "Regular price ...", "Offer Available", etc.
+
+    if len(prices) >= 2:
+        mrp   = prices[0]
+        price = prices[1]
+    elif len(prices) == 1:
+        mrp   = prices[0]
+        price = prices[0]
+    else:
+        mrp = price = ""
 
     return {
         "name":             name,
-        "brand":            brand,
-        "mrp":              mrp or price,
+        "mrp":              mrp,
         "price":            price,
         "discount_percent": discount,
         "volume_ml":        extract_volume(name),
-        "rating":           rating,
         "num_ratings":      num_ratings,
-        "num_reviews":      "",
         "product_url":      product_url,
         "image_url":        img,
         "page_no":          page_num,
     }
 
-async def parse_from_dom(page, page_num: int) -> list[dict]:
-    cards = await page.evaluate(JS_EXTRACTOR)
-    products = [parse_card_texts(c["href"], c["texts"], c["img"], page_num) for c in cards]
-    print(f"    DOM fallback: {len(products)} products")
-    return products
+# ── JS extractor (runs inside browser) ───────────────────────────────────────
+# Deduplicates by productId in the URL query string.
+
+JS_EXTRACT = """
+() => {
+    const seen = new Set();
+    const out  = [];
+
+    for (const a of document.querySelectorAll('a[href*="/p/"]')) {
+        const href = a.getAttribute('href') || '';
+        if (!href) continue;
+
+        // Use productId as unique key so image-link and text-link collapse to one
+        const m = href.match(/productId=(\d+)/);
+        const key = m ? m[1] : href;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        const text = a.innerText || '';
+        const img  = a.querySelector('img');
+        const src  = img ? (img.src || img.getAttribute('data-src') || '') : '';
+
+        out.push({ href, text, img: src });
+    }
+    return out;
+}
+"""
 
 # ── Per-page scrape ───────────────────────────────────────────────────────────
 
@@ -239,27 +152,10 @@ async def scrape_page(browser, page_num: int) -> list[dict]:
             "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
-            "Upgrade-Insecure-Requests": "1",
         },
     )
 
     page = await context.new_page()
-    intercepted: list[dict] = []
-
-    async def capture(response):
-        if response.status != 200:
-            return
-        ct = response.headers.get("content-type", "")
-        if "json" not in ct:
-            return
-        try:
-            data = await response.json()
-            if _find_product_lists(data):
-                intercepted.append(data)
-        except Exception:
-            pass
-
-    page.on("response", capture)
 
     url = f"{BASE_URL}?page_no={page_num}&{PARAMS}"
     try:
@@ -272,41 +168,22 @@ async def scrape_page(browser, page_num: int) -> list[dict]:
     await page.wait_for_timeout(3_000)
 
     # Scroll to trigger lazy-loaded products
-    for _ in range(6):
+    for _ in range(8):
         await page.evaluate("window.scrollBy(0, window.innerHeight)")
-        await page.wait_for_timeout(700)
+        await page.wait_for_timeout(600)
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     await page.wait_for_timeout(2_000)
 
-    products: list[dict] = []
+    # Extract all product cards via JS
+    cards = await page.evaluate(JS_EXTRACT)
 
-    # ── Strategy 1: __NEXT_DATA__ (embedded JSON in page HTML) ──
-    try:
-        next_data = await page.evaluate(
-            "() => { try { return JSON.parse(document.getElementById('__NEXT_DATA__').textContent); } catch(e) { return null; } }"
-        )
-        if next_data:
-            products = parse_from_json(next_data, page_num)
-            if products:
-                print(f"    __NEXT_DATA__: {len(products)} products")
-    except Exception:
-        pass
+    products = [
+        parse_card(c["href"], c["text"], c["img"], page_num)
+        for c in cards
+        if c["text"].strip()
+    ]
 
-    # ── Strategy 2: intercepted API JSON responses ──
-    if not products:
-        best: list[dict] = []
-        for data in intercepted:
-            parsed = parse_from_json(data, page_num)
-            if len(parsed) > len(best):
-                best = parsed
-        if best:
-            products = best
-            print(f"    API intercept: {len(products)} products")
-
-    # ── Strategy 3: JS DOM extraction ──
-    if not products:
-        products = await parse_from_dom(page, page_num)
-
+    print(f"    {len(products)} products found")
     await context.close()
     return products
 
@@ -315,9 +192,9 @@ async def scrape_page(browser, page_num: int) -> list[dict]:
 async def main():
     print(f"Nykaa Fragrance Scraper  |  {TOTAL_PAGES} pages  →  {OUTPUT_FILE}\n")
 
-    output_path = Path(OUTPUT_FILE)
+    output_path   = Path(OUTPUT_FILE)
     scraped_pages: set[int] = set()
-    all_products: list[dict] = []
+    all_products:  list[dict] = []
 
     if output_path.exists():
         with open(output_path, newline="", encoding="utf-8") as f:
