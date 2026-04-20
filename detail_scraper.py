@@ -21,7 +21,7 @@ from playwright.async_api import async_playwright
 
 INPUT_FILE  = "nykaa_fragrances.csv"   # CSV with product_url column
 OUTPUT_FILE = "nykaa_fragrances_full.csv"
-CONCURRENCY = 10                        # parallel browser pages
+CONCURRENCY = 5                         # parallel browser pages
 URL_COLUMN  = "product_url"
 
 CSV_FIELDS = [
@@ -183,7 +183,7 @@ async def scrape_product(browser, sem: asyncio.Semaphore, url: str) -> dict:
 
         for attempt in range(1, 4):
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                 await page.wait_for_timeout(2_000)
 
                 d = await page.evaluate(JS_PRODUCT)
@@ -283,7 +283,10 @@ async def main():
 
             print(f"[{batch_start + 1}–{batch_end} / {total}] scraping...")
 
-            tasks = [scrape_product(browser, sem, url) for url in batch]
+            tasks = []
+            for i, url in enumerate(batch):
+                await asyncio.sleep(i * 0.3)   # stagger start times
+                tasks.append(asyncio.create_task(scrape_product(browser, sem, url)))
             results = await asyncio.gather(*tasks)
 
             all_results.extend(results)
